@@ -1,35 +1,90 @@
-import os
+import sqlite3
 from dotenv import load_dotenv
 from langchain.tools import tool
 from langchain_groq import ChatGroq 
-from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
+from langchain_core.messages import SystemMessage, HumanMessage, ToolMessage
 from langgraph.graph import StateGraph
 
 # Load variables from .env
 load_dotenv() 
+
+# --- 0) Database Setup ---
+DB_FILE = "ecommerce.db"
+
+def init_db():
+    """Initialize a local SQLite database with some dummy data if it doesn't exist."""
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS orders (
+            order_id TEXT PRIMARY KEY,
+            status TEXT
+        )
+    """)
+    # Insert some default records if the table is empty
+    cursor.execute("SELECT count(*) FROM orders")
+    if cursor.fetchone()[0] == 0:
+        sample_orders = [
+            ("A12345", "Processing - Not shipped yet."),
+            ("B98765", "Shipped - Out for delivery."),
+            ("C11111", "Delivered yesterday.")
+        ]
+        cursor.executemany("INSERT INTO orders VALUES (?, ?)", sample_orders)
+        conn.commit()
+    conn.close()
+
+# Run DB initialization on startup
+init_db()
 
 # --- 1) Define our business tools ---
 
 @tool
 def cancel_order(order_id: str) -> str:
     """Cancel an order that hasn't shipped."""
-    return f"Order {order_id} has been cancelled."
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Check if order exists first
+    cursor.execute("SELECT status FROM orders WHERE order_id = ?", (order_id,))
+    row = cursor.fetchone()
+    
+    if not row:
+        conn.close()
+        return f"Order {order_id} not found."
+        
+    if "Shipped" in row[0] or "Delivered" in row[0]:
+        conn.close()
+        return f"Cannot cancel order {order_id} because it has already shipped or been delivered."
+        
+    # Update the status to Cancelled
+    cursor.execute("UPDATE orders SET status = 'Cancelled' WHERE order_id = ?", (order_id,))
+    conn.commit()
+    conn.close()
+    
+    return f"Order {order_id} has been successfully cancelled in the database."
 
 @tool
 def check_order_status(order_id: str) -> str:
     """Check the current shipping status of an order."""
-    # A tiny fake database for testing
-    simulated_db = {
-        "A12345": "Processing - Not shipped yet.",
-        "B98765": "Shipped - Out for delivery.",
-        "C11111": "Delivered yesterday."
-    }
-    return simulated_db.get(order_id, "Status unknown. Order not found.")
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    cursor.execute("SELECT status FROM orders WHERE order_id = ?", (order_id,))
+    row = cursor.fetchone()
+    conn.close()
+    
+    if row:
+        return f"Status for {order_id}: {row[0]}"
+    return f"Status unknown. Order {order_id} not found."
 
-# Create a dictionary so we can easily look up the right tool to run later
+@tool
+def escalate_to_human(summary: str) -> str:
+    """Escalate the conversation to a human agent. Use this if the user is angry, asks for a human, or has an issue you can't solve."""
+    return f"Ticket successfully created for human support team. (Summary: {summary})"
+
 tools_dict = {
     "cancel_order": cancel_order,
-    "check_order_status": check_order_status
+    "check_order_status": check_order_status,
+    "escalate_to_human": escalate_to_human
 }
 
 # --- 2) The agent "brain" ---
@@ -37,42 +92,43 @@ def call_model(state):
     msgs = state["messages"]
     order = state.get("order", {"order_id": "UNKNOWN"})
     
-    # Updated Prompt: Now tells the agent about checking statuses!
     prompt = (
         f"You are a helpful ecommerce support agent.\n"
-        f"The user's current ORDER ID is: {order['order_id']}\n"
-        f"If the customer asks to cancel, call cancel_order(order_id).\n"
-        f"If the customer asks for the status or where their package is, call check_order_status(order_id).\n"
-        f"Otherwise, just respond normally and politely."
+        f"The user's current ORDER ID is: {order['order_id']}. DO NOT ask the user for their order ID, use this one automatically.\n"
+        f"RULES:\n"
+        f"1. If they ask to cancel, call cancel_order(order_id). DO NOT use this tool for returns.\n"
+        f"2. If they ask for shipping status, call check_order_status(order_id).\n"
+        f"3. If they are angry, ask for a real person, ask to RETURN an item, or ask something you cannot do, call escalate_to_human(summary).\n"
+        f"4. After calling a tool, you MUST reply to the user with the exact outcome of the tool."
     )
     
     full_messages = [SystemMessage(content=prompt)] + msgs
     
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-    # Update: Bind BOTH tools to the LLM
-    llm_with_tools = llm.bind_tools([cancel_order, check_order_status])
+    # Upgrade to the 70 Billion parameter model for better tool reliability!
+    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    llm_with_tools = llm.bind_tools([cancel_order, check_order_status, escalate_to_human])
     
     first = llm_with_tools.invoke(full_messages)
-    out = [first]
+    new_messages = [first]
     
     if getattr(first, "tool_calls", None):
-        # The LLM decided to call a tool!
-        tc = first.tool_calls[0]
-        tool_name = tc["name"]
-        tool_args = tc["args"]
+        # UPGRADE: Loop through ALL tool calls requested by the LLM
+        for tc in first.tool_calls:
+            tool_name = tc["name"]
+            tool_args = tc["args"]
+            
+            print(f"\n[System: Running backend tool '{tool_name}'...]")
+            selected_tool = tools_dict[tool_name]
+            result = selected_tool.invoke(tool_args) 
+            
+            # Append each tool result sequentially
+            new_messages.append(ToolMessage(content=str(result), tool_call_id=tc["id"]))
+            
+        # 2nd pass: Let the LLM read all tool results and respond
+        second = llm_with_tools.invoke(full_messages + new_messages)
+        new_messages.append(second)
         
-        # Look up the tool in our dictionary and execute it
-        print(f"\n[System: Running backend tool '{tool_name}'...]")
-        selected_tool = tools_dict[tool_name]
-        result = selected_tool.invoke(tool_args) 
-        
-        out.append(ToolMessage(content=result, tool_call_id=tc["id"]))
-        
-        # 2nd pass: Let the LLM read the tool result and respond to the user
-        second = llm_with_tools.invoke(full_messages + out)
-        out.append(second)
-        
-    return {"messages": out}
+    return {"messages": msgs + new_messages}
 
 # --- 3) Wire it all up ---
 def construct_graph():
@@ -85,11 +141,13 @@ def construct_graph():
 if __name__ == "__main__":
     graph = construct_graph()
     
-    # Let's test with order B98765, which is already "Shipped"
-    example_order = {"order_id": "B98765"}
+    # We will use A12345 so we can successfully test a cancellation!
+    example_order = {"order_id": "A12345"}
     
     print("Welcome to Customer Support! (Type 'quit' to exit)")
     print("---------------------------------------------------")
+    
+    chat_history = []
     
     while True:
         user_input = input("\nYou: ")
@@ -98,8 +156,9 @@ if __name__ == "__main__":
             print("Ending chat. Goodbye!")
             break
             
-        convo = [HumanMessage(content=user_input)]
-        result = graph.invoke({"order": example_order, "messages": convo})
+        chat_history.append(HumanMessage(content=user_input))
+        result = graph.invoke({"order": example_order, "messages": chat_history})
+        chat_history = result["messages"]
         
-        final_response = result["messages"][-1].content
+        final_response = chat_history[-1].content
         print(f"Agent: {final_response}")
